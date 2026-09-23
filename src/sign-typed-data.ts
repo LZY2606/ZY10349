@@ -1,5 +1,5 @@
 import { arrToBufArr, ecsign, publicToAddress } from '@ethereumjs/util';
-import { encode, encodePacked } from '@metamask/abi-utils';
+import { encodePacked } from '@metamask/abi-utils';
 import {
   getArrayType,
   getByteLength,
@@ -8,8 +8,6 @@ import {
 } from '@metamask/abi-utils/dist/parsers';
 import { padStart } from '@metamask/abi-utils/dist/utils';
 import {
-  add0x,
-  assert,
   bigIntToBytes,
   bytesToHex,
   concatBytes,
@@ -17,10 +15,19 @@ import {
   isStrictHexString,
   numberToBytes,
   signedBigIntToBytes,
-  stringToBytes,
 } from '@metamask/utils';
 import { keccak256 } from 'ethereum-cryptography/keccak';
 
+import {
+  ByteEncoder,
+  TypeDependencyGraph,
+  V3_ENCODING_POLICY,
+  V4_ENCODING_POLICY,
+  normalizeBool,
+  parseNumber,
+  walkTypedValue,
+} from './eip712';
+import type { EncodingPolicy } from './eip712';
 import {
   concatSig,
   isNullish,
@@ -152,233 +159,26 @@ function validateVersion(
 }
 
 /**
- * Parse a string, number, or bigint value into a `Uint8Array`.
+ * Get the version-specific encoding policy for the typed-data pipeline.
  *
- * @param type - The type of the value.
- * @param value - The value to parse.
- * @returns The parsed value.
+ * @param version - The EIP-712 version to get the policy for.
+ * @returns The encoding policy.
  */
-function parseNumber(type: string, value: string | number | bigint) {
-  assert(
-    value !== null,
-    `Unable to encode value: Invalid number. Expected a valid number value, but received "${value}".`,
-  );
-
-  const bigIntValue = BigInt(value);
-
-  const length = getLength(type);
-  const maxValue = BigInt(2) ** BigInt(length) - BigInt(1);
-
-  // Note that this is not accurate, since the actual maximum value for unsigned
-  // integers is `2 ^ (length - 1) - 1`, but this is required for backwards
-  // compatibility with the old implementation.
-  assert(
-    bigIntValue >= -maxValue && bigIntValue <= maxValue,
-    `Unable to encode value: Number "${value}" is out of range for type "${type}".`,
-  );
-
-  return bigIntValue;
-}
-
-/**
- * Normalize a value for the Solidity `bool` type. Only real booleans and the
- * exact strings `'true'` and `'false'` are accepted; anything else is rejected.
- *
- * The previous `Boolean(value)` implementation was a signing footgun: every
- * non-empty string is truthy, so a `bool` field supplied as the string
- * `'false'` was signed as `true` while UIs stringifying the raw value displayed
- * `'false'`. Rejecting ambiguous input keeps the signed value consistent with
- * what was requested.
- *
- * @param value - The value to normalize.
- * @returns The normalized boolean.
- * @throws If the value is not a boolean or the string `'true'` or `'false'`.
- */
-function normalizeBool(value: unknown): boolean {
-  if (typeof value === 'boolean') {
-    return value;
-  }
-
-  if (value === 'true') {
-    return true;
-  }
-
-  if (value === 'false') {
-    return false;
-  }
-
-  throw new Error(
-    `Unable to encode value: Invalid bool. Expected a boolean or the string "true" or "false", but received "${String(
-      value,
-    )}".`,
-  );
-}
-
-/**
- * Parse an address string to a `Uint8Array`. The behaviour of this is quite
- * strange, in that it does not parse the address as hexadecimal string, nor as
- * UTF-8. It does some weird stuff with the string and char codes, and then
- * returns the result as a `Uint8Array`.
- *
- * This is based on the old `ethereumjs-abi` implementation, which essentially
- * calls `new BN(address, 10)` on the address string, the equivalent of calling
- * `parseInt(address, 10)` in JavaScript. This is not a valid way to parse an
- * address and would result in `NaN` in plain JavaScript, but it is the
- * behaviour of the old implementation, and so we must preserve it for backwards
- * compatibility.
- *
- * @param address - The address to parse.
- * @returns The parsed address.
- */
-function reallyStrangeAddressToBytes(address: string): Uint8Array {
-  let addressValue = BigInt(0);
-
-  for (let i = 0; i < address.length; i++) {
-    const character = BigInt(address.charCodeAt(i) - 48);
-    addressValue *= BigInt(10);
-
-    // 'a'
-    if (character >= 49) {
-      addressValue += character - BigInt(49) + BigInt(0xa);
-
-      // 'A'
-    } else if (character >= 17) {
-      addressValue += character - BigInt(17) + BigInt(0xa);
-
-      // '0' - '9'
-    } else {
-      addressValue += character;
-    }
-  }
-
-  return padStart(bigIntToBytes(addressValue), 20);
-}
-
-/**
- * Encode a single field.
- *
- * @param types - All type definitions.
- * @param name - The name of the field to encode.
- * @param type - The type of the field being encoded.
- * @param value - The value to encode.
- * @param version - The EIP-712 version the encoding should comply with.
- * @returns Encoded representation of the field.
- */
-function encodeField(
-  types: Record<string, MessageTypeProperty[]>,
-  name: string,
-  type: string,
-  // TODO: constrain type on `value`
-  value: any,
+function getEncodingPolicy(
   version: SignTypedDataVersion.V3 | SignTypedDataVersion.V4,
-): [type: string, value: bigint | Buffer | boolean | string | Uint8Array] {
-  validateVersion(version, [SignTypedDataVersion.V3, SignTypedDataVersion.V4]);
-
-  if (types[type] !== undefined) {
-    return [
-      'bytes32',
-      // TODO: return Buffer, remove string from return type
-      version === SignTypedDataVersion.V4 && value == null // eslint-disable-line no-eq-null
-        ? '0x0000000000000000000000000000000000000000000000000000000000000000'
-        : arrToBufArr(keccak256(encodeData(type, value, types, version))),
-    ];
-  }
-
-  // `function` is supported in `@metamask/abi-utils`, but not allowed by
-  // EIP-712, so we throw an error here.
-  if (type === 'function') {
-    throw new Error('Unsupported or invalid type: "function"');
-  }
-
-  if (value === undefined) {
-    throw new Error(`missing value for field ${name} of type ${type}`);
-  }
-
-  if (type === 'address') {
-    if (typeof value === 'number') {
-      return ['address', padStart(numberToBytes(value), 20)];
-    } else if (isStrictHexString(value)) {
-      return ['address', add0x(value)];
-    } else if (typeof value === 'string') {
-      return ['address', reallyStrangeAddressToBytes(value).subarray(0, 20)];
-    }
-  }
-
-  if (type === 'bool') {
-    return ['bool', normalizeBool(value)];
-  }
-
-  if (type === 'bytes') {
-    if (typeof value === 'number') {
-      value = numberToBytes(value);
-    } else if (isStrictHexString(value) || value === '0x') {
-      value = hexToBytes(value);
-    } else if (typeof value === 'string') {
-      value = stringToBytes(value);
-    }
-    return ['bytes32', arrToBufArr(keccak256(value))];
-  }
-
-  if (type.startsWith('bytes') && type !== 'bytes' && !type.includes('[')) {
-    if (typeof value === 'number') {
-      if (value < 0) {
-        return ['bytes32', new Uint8Array(32)];
-      }
-
-      return ['bytes32', bigIntToBytes(BigInt(value))];
-    } else if (isStrictHexString(value)) {
-      return ['bytes32', hexToBytes(value)];
-    }
-
-    return ['bytes32', value];
-  }
-
-  if (type.startsWith('int') && !type.includes('[')) {
-    const bigIntValue = parseNumber(type, value);
-    if (bigIntValue >= BigInt(0)) {
-      return ['uint256', bigIntValue];
-    }
-
-    return ['int256', bigIntValue];
-  }
-
-  if (type === 'string') {
-    if (typeof value === 'number') {
-      value = numberToBytes(value);
-    } else {
-      value = stringToBytes(value ?? '');
-    }
-    return ['bytes32', arrToBufArr(keccak256(value))];
-  }
-
-  if (type.endsWith(']')) {
-    if (version === SignTypedDataVersion.V3) {
-      throw new Error(
-        'Arrays are unimplemented in encodeData; use V4 extension',
-      );
-    }
-    const parsedType = type.slice(0, type.lastIndexOf('['));
-    const typeValuePairs = value.map((item: any) =>
-      encodeField(types, name, parsedType, item, version),
-    );
-    return [
-      'bytes32',
-      arrToBufArr(
-        keccak256(
-          encode(
-            typeValuePairs.map(([t]) => t),
-            typeValuePairs.map(([, v]) => v),
-          ),
-        ),
-      ),
-    ];
-  }
-
-  return [type, value];
+): EncodingPolicy {
+  return version === SignTypedDataVersion.V3
+    ? V3_ENCODING_POLICY
+    : V4_ENCODING_POLICY;
 }
 
 /**
  * Encodes an object by encoding and concatenating each of its members.
+ *
+ * This is a thin adapter over the typed-data pipeline: the type dependency
+ * graph interprets each type string once, the value walker turns the message
+ * into a stream of validated typed value events, and the byte encoder
+ * consumes those events to produce the final encoding.
  *
  * @param primaryType - The root type.
  * @param data - The object to encode.
@@ -394,27 +194,16 @@ function encodeData(
 ): Buffer {
   validateVersion(version, [SignTypedDataVersion.V3, SignTypedDataVersion.V4]);
 
-  const encodedTypes = ['bytes32'];
-  const encodedValues: (string | bigint | boolean | Uint8Array | Buffer)[] = [
-    hashType(primaryType, types),
-  ];
-
-  for (const field of types[primaryType]) {
-    if (version === SignTypedDataVersion.V3 && data[field.name] === undefined) {
-      continue;
-    }
-    const [type, value] = encodeField(
-      types,
-      field.name,
-      field.type,
-      data[field.name],
-      version,
-    );
-    encodedTypes.push(type);
-    encodedValues.push(value);
-  }
-
-  return arrToBufArr(encode(encodedTypes, encodedValues));
+  const graph = new TypeDependencyGraph(types);
+  const encoder = new ByteEncoder();
+  walkTypedValue({
+    graph,
+    primaryType,
+    value: data,
+    policy: getEncodingPolicy(version),
+    sink: encoder,
+  });
+  return arrToBufArr(encoder.getResult());
 }
 
 /**
@@ -428,23 +217,7 @@ function encodeType(
   primaryType: string,
   types: Record<string, MessageTypeProperty[]>,
 ): string {
-  let result = '';
-  const unsortedDeps = findTypeDependencies(primaryType, types);
-  unsortedDeps.delete(primaryType);
-
-  const deps = [primaryType, ...Array.from(unsortedDeps).sort()];
-  for (const type of deps) {
-    const children = types[type];
-    if (!children) {
-      throw new Error(`No type definition specified: ${type}`);
-    }
-
-    result += `${type}(${types[type]
-      .map(({ name, type: t }) => `${t} ${name}`)
-      .join(',')})`;
-  }
-
-  return result;
+  return new TypeDependencyGraph(types).getCanonicalTypeString(primaryType);
 }
 
 /**
@@ -460,23 +233,10 @@ function findTypeDependencies(
   types: Record<string, MessageTypeProperty[]>,
   results: Set<string> = new Set(),
 ): Set<string> {
-  if (typeof primaryType !== 'string') {
-    throw new Error(
-      `Invalid findTypeDependencies input ${JSON.stringify(primaryType)}`,
-    );
-  }
-  const match = primaryType.match(/^\w*/u) as RegExpMatchArray;
-  [primaryType] = match;
-  if (results.has(primaryType) || types[primaryType] === undefined) {
-    return results;
-  }
-
-  results.add(primaryType);
-
-  for (const field of types[primaryType]) {
-    findTypeDependencies(field.type, types, results);
-  }
-  return results;
+  return new TypeDependencyGraph(types).collectDependencies(
+    primaryType,
+    results,
+  );
 }
 
 /**
@@ -513,8 +273,7 @@ function hashType(
   primaryType: string,
   types: Record<string, MessageTypeProperty[]>,
 ): Buffer {
-  const encodedHashType = stringToBytes(encodeType(primaryType, types));
-  return arrToBufArr(keccak256(encodedHashType));
+  return arrToBufArr(new TypeDependencyGraph(types).getTypeHash(primaryType));
 }
 
 /**
@@ -554,7 +313,20 @@ function eip712DomainHash<T extends MessageTypes>(
 ): Buffer {
   validateVersion(version, [SignTypedDataVersion.V3, SignTypedDataVersion.V4]);
 
-  const sanitizedData = sanitizeData(typedData);
+  return hashSanitizedDomain(sanitizeData(typedData), version);
+}
+
+/**
+ * Create a EIP-712 Domain Hash from an already sanitized typed message.
+ *
+ * @param sanitizedData - The sanitized typed message.
+ * @param version - The EIP-712 version the encoding should comply with.
+ * @returns The hash of the domain object.
+ */
+function hashSanitizedDomain<T extends MessageTypes>(
+  sanitizedData: TypedMessage<T>,
+  version: SignTypedDataVersion.V3 | SignTypedDataVersion.V4,
+): Buffer {
   const { domain } = sanitizedData;
   const domainType = { EIP712Domain: sanitizedData.types.EIP712Domain };
   return hashStruct('EIP712Domain', domain, domainType, version);
@@ -580,7 +352,7 @@ function eip712Hash<T extends MessageTypes>(
 
   const sanitizedData = sanitizeData(typedData);
   const parts = [hexToBytes('1901')];
-  parts.push(eip712DomainHash(typedData, version));
+  parts.push(hashSanitizedDomain(sanitizedData, version));
 
   if (sanitizedData.primaryType !== 'EIP712Domain') {
     parts.push(
